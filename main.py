@@ -1,11 +1,26 @@
 from flask import Flask, jsonify, request
 from datetime import datetime
+import signal
+import threading
+import json
+import sys
 
 
+terminating = threading.Event()
 last_op_template = {"copy": None, "ver": None, "sync": None}
 status_template = {"copy": None, "ver": None, "sync": None}
 interval_template = {"copy": 60*24, "ver": 60*24, "sync": 60*72}
-stations = {"Pi4": {"master": {"interval": interval_template, "status": status_template, "last_op": last_op_template}}}
+stations_template = {"Pi4": {"master": {"interval": interval_template, "status": status_template, "last_op": last_op_template}}}
+stations = None
+failed_jobs = set()
+failed_jobs_notified = set()
+
+
+def signal_handler(sig, frame):
+    print('terminating...')
+    terminating.set()
+    save_status()
+    sys.exit(0)
 
 
 def traverse(d, path):
@@ -19,6 +34,14 @@ def traverse(d, path):
     return jsonify(res)
 
 
+def save_status():
+    with open('stations.json', 'w') as fp:
+        json.dump(stations, fp)
+
+def load_status():
+    with open('stations.json', 'r') as fp:
+        stations = json.load(fp)
+
 app = Flask(__name__)
 
 @app.route('/')
@@ -27,7 +50,6 @@ def index():
 
 @app.route('/status', methods=['GET'])
 def status_all():
-    check_elapsed()
     return jsonify({'stations': stations})
 
 @app.route('/status/<path:path>', methods=['GET'])
@@ -46,6 +68,8 @@ def create():
     else:
         stations[station] = {repo: {"status": status_template, "interval": interval_template, "last_op": last_op_template}}
 
+    save_status()
+
     return jsonify({"result": "OK"})
     
 
@@ -57,6 +81,8 @@ def update():
     operation = request.form.get('operation')
 
     stations[station][repo]["last_op"][operation] = str(datetime.now())
+
+    save_status()
 
     return jsonify({"result": "OK"})
 
@@ -80,12 +106,39 @@ def check_elapsed():
                 ts = stations[station][repo]["last_op"][operation]
                 time_limit = stations[station][repo]["interval"][operation]
                 error = is_elapsed(station, repo, operation, time_limit)
-                status = "KO" if error else "OK"
                 stations[station][repo]["status"][operation] = not error
+
+                item = (station, repo, operation)
+                if error:
+                    if not item in failed_jobs_notified:
+                        failed_jobs.add(item)
+                elif item in failed_jobs_notified:
+                    failed_jobs_notified.remove(item)
+
+
+def status_service():
+    import time
+    while not terminating.is_set():
+        check_elapsed()
+        time.sleep(1)
+    save_status()
 
 
 if __name__ == "__main__":
     from waitress import serve
-    check_elapsed()
+    # check_elapsed()
+
+    signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        load_status()
+    except FileNotFoundError as e:
+        print("no previous saved status to load..")
+    except json.decoder.JSONDecodeError as e:
+        print("status file is broken.")
+
+    stations = stations_template if stations is None else stations
+
+    threading.Thread(target=status_service).start()
     serve(app, host="0.0.0.0", port=8080)
     # app.run(debug=True)
